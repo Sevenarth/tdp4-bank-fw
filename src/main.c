@@ -35,7 +35,7 @@
  * Private types/enumerations/variables
  ****************************************************************************/
 
-#define TEST_CCAN_BAUD_RATE 500000
+#define TEST_CCAN_BAUD_RATE 1000000
 
 CCAN_MSG_OBJ_T msg_obj;
 
@@ -145,6 +145,8 @@ void baudrateCalculate(uint32_t baud_rate, uint32_t *can_api_timing_cfg)
 	}
 }
 
+int xl_axis = 0, g_axis = 0, m_axis = 0;
+
 /*	CAN receive callback */
 /*	Function is executed by the Callback handler after
     a CAN message has been received */
@@ -153,23 +155,28 @@ void CAN_rx(uint8_t msg_obj_num) {
 	msg_obj.msgobj = msg_obj_num;
 	/* Now load up the msg_obj structure with the CAN message */
 	LPC_CCAN_API->can_receive(&msg_obj);
-	if (msg_obj_num == 1 || msg_obj_num == 2) {
-		/* Simply transmit CAN frame (echo) with with ID +0x100 via buffer 2 */
-		DEBUGOUT("Received message from %x: %x%x%x%x%x%x%x%x (dlc %u)\n",
-				msg_obj.mode_id,
-				msg_obj.data[0],
-				msg_obj.data[1],
-				msg_obj.data[2],
-				msg_obj.data[3],
-				msg_obj.data[4],
-				msg_obj.data[5],
-				msg_obj.data[6],
-				msg_obj.data[7],
-				msg_obj.dlc);
+	if (msg_obj_num == 1) {
+		uint32_t recv_val = msg_obj.data[0] |
+				(msg_obj.data[1] << 8)      |
+				(msg_obj.data[2] << 16)     |
+				(msg_obj.data[3] << 24);
 
-		msg_obj.msgobj = 0;
-		msg_obj.mode_id += 0x100;
-		LPC_CCAN_API->can_transmit(&msg_obj);
+		int32_t value = (int32_t)recv_val;
+
+		switch(msg_obj.mode_id) {
+		case 0x101:
+			DEBUGOUT("XL: %d: %d\n", xl_axis++, value);
+			xl_axis = xl_axis % 3;
+			break;
+		case 0x102:
+			DEBUGOUT("G: %d: %d\n", g_axis++, value);
+			g_axis = g_axis % 3;
+			break;
+		case 0x103:
+			DEBUGOUT("M: %d: %d\n", m_axis++, value);
+			m_axis = m_axis % 3;
+			break;
+		}
 	}
 }
 
@@ -197,12 +204,24 @@ void CAN_IRQHandler(void) {
 	LPC_CCAN_API->isr();
 }
 
+
+void PIOINT0_IRQHandler() {
+	if(LPC_GPIO[0].MIS & (1 << 9)) { // Interrupt on PIO0_7 triggered
+		LPC_GPIO[0].IC |= 1 << 9; // Clear edge-sensitive interrupt
+
+		DEBUGOUT("sampling toggled\n");
+
+		msg_obj.msgobj = 1;
+		msg_obj.mode_id = 0x3;
+		msg_obj.dlc = 0;
+		LPC_CCAN_API->can_transmit(&msg_obj);
+	}
+}
+
 /*****************************************************************************
  * Public functions
  ****************************************************************************/
 
-volatile uint32_t *CAN_CNTL = 0x40050000;
-volatile uint32_t *CAN_TEST = 0x40050014;
 
 /**
  * @brief	Main routine for CCAN_ROM example
@@ -210,7 +229,19 @@ volatile uint32_t *CAN_TEST = 0x40050014;
  */
 int main(void)
 {
+	SystemCoreClockUpdate();
+	Board_Init();
+
 	int xflag = 0;
+
+	LPC_IOCON->REG[IOCON_PIO0_9] = IOCON_FUNC0 | IOCON_MODE_PULLDOWN; // Set PIO0_3 to GPIO with pull-up resistor
+	LPC_GPIO[0].DIR &= ~(1 << 9); // Set PIO0_3 to input
+	LPC_GPIO[0].IS  &= ~(1 << 9); // Set edge-sensitive interrupt on PIO0_3
+	LPC_GPIO[0].IBE &= ~(1 << 9); // Set single edge interrupt on PIO0_3
+	LPC_GPIO[0].IEV |= 1 << 9;    // Set rising edge interrupt on PIO0_3
+	LPC_GPIO[0].IE  |= 1 << 9;    // Enable interrupt on PIO0_3
+	LPC_GPIO[0].IC |= 1 << 9;
+
 	uint32_t CanApiClkInitTable[2];
 	/* Publish CAN Callback Functions */
 	CCAN_CALLBACKS_T callbacks = {
@@ -223,8 +254,6 @@ int main(void)
 		NULL,
 		NULL,
 	};
-	SystemCoreClockUpdate();
-	Board_Init();
 	baudrateCalculate(TEST_CCAN_BAUD_RATE, CanApiClkInitTable);
 
 	LPC_CCAN_API->init_can(&CanApiClkInitTable[0], TRUE);
@@ -233,67 +262,15 @@ int main(void)
 	/* Enable the CAN Interrupt */
 	NVIC_EnableIRQ(CAN_IRQn);
 
-	/* Configure message object 1 to receive all 11-bit messages 0x300-0x3FF */
+	NVIC_EnableIRQ(EINT0_IRQn);
+
+	/* Configure message object 1 to receive all 11-bit messages 0x100-0x1FF */
 	msg_obj.msgobj = 1;
-	msg_obj.mode_id = 0x300;
-	msg_obj.mask = 0x700;
+	msg_obj.mode_id = 0x100;
+	msg_obj.mask = 0x100;
 	LPC_CCAN_API->config_rxmsgobj(&msg_obj);
 
-	/* Configure message object 1 to receive all 11-bit messages 0x400-0x4FF */
-	msg_obj.msgobj = 2;
-	msg_obj.mode_id = 0x400;
-	msg_obj.mask = 0x700;
-	LPC_CCAN_API->config_rxmsgobj(&msg_obj);
-
-	/* Configure message object 1 to receive all 11-bit messages 0x500-0x5FF */
-	msg_obj.msgobj = 3;
-	msg_obj.mode_id = 0x500;
-	msg_obj.mask = 0x700;
-	LPC_CCAN_API->config_rxmsgobj(&msg_obj);
-
-	/* Send a simple one time CAN message */
-	msg_obj.msgobj  = 0;
-	msg_obj.mode_id = 0x345;
-	msg_obj.mask    = 0x0;
-	msg_obj.dlc     = 4;
-	msg_obj.data[0] = 'T';	// 0x54
-	msg_obj.data[1] = 'E';	// 0x45
-	msg_obj.data[2] = 'S';	// 0x53
-	msg_obj.data[3] = 'T';	// 0x54
-	LPC_CCAN_API->can_transmit(&msg_obj);
-
-	while (!xflag) {
-		switch (can_menu()) {
-		case 0:
-			xflag = 1;
-			DEBUGOUT("End of CAN Demo! Bye!\r\n");
-			break;
-
-		case 1:
-		{
-			int mode_id = con_get_input("Enter mode id: ");
-
-			/* Send a simple one time CAN message */
-			msg_obj.msgobj  = 0;
-			msg_obj.mode_id = mode_id;
-			msg_obj.mask    = 0x0;
-			msg_obj.dlc     = 4;
-			msg_obj.data[0] = 'T';	// 0x54
-			msg_obj.data[1] = 'E';	// 0x45
-			msg_obj.data[2] = 'S';	// 0x53
-			msg_obj.data[3] = 'T';	// 0x54
-			LPC_CCAN_API->can_transmit(&msg_obj);
-
-			break;
-		}
-		case 2:
-		{
-			*CAN_CNTL ^= 1 << 7;
-			*CAN_TEST ^= 1 << 4;
-			DEBUGOUT("Loopback toggled! Status: %d\n", (*CAN_TEST) >> 4 & 1);
-		}
-		default:
-			DEBUGOUT("Input Invalid! Try Again.\r\n");
-		}
+	while (1) {
+		__WFI();
 	}
 }
